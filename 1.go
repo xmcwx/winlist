@@ -129,19 +129,6 @@ func addFileToZip(zipWriter *zip.Writer, filename string) error {
 	return err
 }
 
-// createSelfDeleteScript creates a temporary PowerShell script to delete the executable and itself
-func createSelfDeleteScript(exePath string) (string, error) {
-	deleteScript := fmt.Sprintf(`Start-Sleep -s 3; Remove-Item -Path "%s" -Force; Remove-Item -Path "$($MyInvocation.MyCommand.Path)" -Force`, exePath)
-
-	scriptPath := filepath.Join(os.TempDir(), "self_delete.ps1")
-	err := os.WriteFile(scriptPath, []byte(deleteScript), 0666)
-	if err != nil {
-		return "", err
-	}
-
-	return scriptPath, nil
-}
-
 // worker function to process files from the queue
 func worker(fileQueue <-chan string, results chan<- *FileInfo, logger *log.Logger, wg *sync.WaitGroup) {
 	for path := range fileQueue {
@@ -169,7 +156,7 @@ func main() {
 	}
 	defer logFile.Close()
 
-	logger := log.New(logFile, "", 0) // properly initialized Logger
+	logger := log.New(logFile, "", 0)
 
 	jsonlFileName := hostname + ".jsonl"
 	jsonlFile, err := os.Create(jsonlFileName)
@@ -181,8 +168,8 @@ func main() {
 	var fileQueue = make(chan string, 100)
 	var results = make(chan *FileInfo, 100)
 	var wg sync.WaitGroup
-	var mutex sync.Mutex // Mutex to ensure thread-safe writes to jsonlFile
-	var lineCount int    // To keep track of the number of JSON lines
+	var mutex sync.Mutex
+	var lineCount int
 
 	numWorkers := runtime.NumCPU()
 	for i := 0; i < numWorkers; i++ {
@@ -255,24 +242,6 @@ func main() {
 		if err2 != nil {
 			log.Fatal("Could not close zip file:", err2)
 		}
-
-		// Create and launch self-delete PowerShell script
-		exePath, err := os.Executable()
-		if err != nil {
-			logger.Printf("[%s] [ERROR] Could not get executable path: %v\n", time.Now().UTC().Format(time.RFC3339), err)
-		} else {
-			scriptPath, err := createSelfDeleteScript(exePath)
-			if err != nil {
-				logger.Printf("[%s] [ERROR] Could not create self-delete script: %v\n", time.Now().UTC().Format(time.RFC3339), err)
-			} else {
-				logger.Printf("[%s] [INFO] Self-delete script created: %s\n", time.Now().UTC().Format(time.RFC3339), scriptPath)
-				cmd := exec.Command("powershell", "-ExecutionPolicy", "Bypass", "-File", scriptPath)
-				err := cmd.Start()
-				if err != nil {
-					logger.Printf("[%s] [ERROR] Could not start self-delete script: %v\n", time.Now().UTC().Format(time.RFC3339), err)
-				}
-			}
-		}
 	}()
 
 	err = addFileToZip(zipWriter, logFileName)
@@ -284,4 +253,20 @@ func main() {
 	if err != nil {
 		log.Fatal("Could not add jsonl file to zip:", err)
 	}
+
+	// Self-delete after completing main operations
+	if err := selfDelete(); err != nil {
+		logger.Printf("[%s] [ERROR] Failed to initiate self-deletion: %v\n", time.Now().UTC().Format(time.RFC3339), err)
+	}
+}
+
+func selfDelete() error {
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("could not get executable path: %v", err)
+	}
+
+	cmd := exec.Command("cmd", "/C", "ping 127.0.0.1 -n 2 > nul && del /F /Q "+exe)
+	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP}
+	return cmd.Start()
 }
