@@ -5,14 +5,15 @@ package main
 
 import (
 	"archive/zip"
+	"bufio"
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log"
-	"mime/multipart"
 	"net/http"
 	"os"
 	"os/exec"
@@ -23,6 +24,11 @@ import (
 	"syscall"
 	"time"
 	"unsafe"
+)
+
+const (
+	defaultAPIURL = "https://your-default-api-url.com/upload"
+	defaultAPIKey = "your-default-api-key"
 )
 
 // FileInfo represents file information
@@ -36,7 +42,7 @@ type FileInfo struct {
 	Modified   string `json:"modified"`
 	Accessed   string `json:"accessed"`
 	Systemname string `json:"systemname"`
-	Source     string `json:"source"`
+	Source     string `json:"source"` // The name of the JSONL file this record is associated with
 }
 
 // getSHA256 calculates the SHA256 hash of a file
@@ -150,6 +156,35 @@ func worker(fileQueue <-chan string, results chan<- *FileInfo, logger *log.Logge
 }
 
 func main() {
+	// Custom usage message
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Winlist - Windows File Listing Tool\n\n")
+		fmt.Fprintf(os.Stderr, "This tool scans the C:\\ drive, collects file information, and uploads it to a specified API.\n\n")
+		fmt.Fprintf(os.Stderr, "Usage:\n")
+		fmt.Fprintf(os.Stderr, "  %s [options]\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Options:\n")
+		flag.PrintDefaults()
+		fmt.Fprintf(os.Stderr, "\nExamples:\n")
+		fmt.Fprintf(os.Stderr, "  1. Use default API URL and key:\n")
+		fmt.Fprintf(os.Stderr, "     %s\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  2. Specify custom API URL and key:\n")
+		fmt.Fprintf(os.Stderr, "     %s -api https://your-api-url.com/upload -key your-api-key\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  3. Specify custom API URL, use default key:\n")
+		fmt.Fprintf(os.Stderr, "     %s -api https://your-api-url.com/upload\n", os.Args[0])
+	}
+
+	// Parse command-line flags
+	apiURL := flag.String("api", defaultAPIURL, "API URL for uploading data")
+	apiKey := flag.String("key", defaultAPIKey, "API key for authentication")
+	help := flag.Bool("help", false, "Show help message")
+	flag.Parse()
+
+	// If -help flag is provided, print usage and exit
+	if *help {
+		flag.Usage()
+		os.Exit(0)
+	}
+
 	startTime := time.Now().UTC()
 	startTimeStr := startTime.Format(time.RFC3339)
 	startTimeStrFile := strings.ReplaceAll(startTimeStr, ":", "_")
@@ -186,6 +221,7 @@ func main() {
 		go worker(fileQueue, results, logger, &wg, jsonlFileName)
 	}
 
+	// Process results from file scanning and write to JSONL file
 	go func() {
 		for result := range results {
 			result.Systemname = hostname
@@ -243,17 +279,6 @@ func main() {
 	}
 
 	zipWriter := zip.NewWriter(zipFile)
-	defer func() {
-		err1 := zipWriter.Close()
-		if err1 != nil {
-			log.Fatal("Could not close zip writer:", err1)
-		}
-
-		err2 := zipFile.Close()
-		if err2 != nil {
-			log.Fatal("Could not close zip file:", err2)
-		}
-	}()
 
 	err = addFileToZip(zipWriter, logFileName)
 	if err != nil {
@@ -265,16 +290,46 @@ func main() {
 		log.Fatal("Could not add jsonl file to zip:", err)
 	}
 
+	// Close the zip writer and file
+	err = zipWriter.Close()
+	if err != nil {
+		log.Fatal("Could not close zip writer:", err)
+	}
+	err = zipFile.Close()
+	if err != nil {
+		log.Fatal("Could not close zip file:", err)
+	}
+
+	// Close the log file and jsonl file
+	logFile.Close()
+	jsonlFile.Close()
+
 	// Upload JSONL file to API
-	err = uploadToAPI(jsonlFileName, logger)
+	err = uploadToAPI(jsonlFileName, logger, *apiURL, *apiKey)
 	if err != nil {
 		logger.Printf("[%s] [ERROR] Failed to upload JSONL file to API: %v\n", time.Now().UTC().Format(time.RFC3339), err)
 	} else {
+		// Wait before deleting local files to ensure upload completion and API processing
+		logger.Printf("[%s] [INFO] Waiting 5 seconds before deleting local files to ensure upload completion...\n", time.Now().UTC().Format(time.RFC3339))
+		time.Sleep(5 * time.Second)
+
 		// Delete local files after successful upload
-		os.Remove(zipFileName)
-		os.Remove(jsonlFileName)
-		os.Remove(logFileName)
-		logger.Printf("[%s] [INFO] Local files deleted after successful upload\n", time.Now().UTC().Format(time.RFC3339))
+		filesToDelete := []string{zipFileName, jsonlFileName, logFileName}
+		for _, file := range filesToDelete {
+			if err := os.Remove(file); err != nil {
+				logger.Printf("[%s] [ERROR] Failed to delete %s: %v\n", time.Now().UTC().Format(time.RFC3339), file, err)
+				// If deletion fails, try again after a short delay
+				time.Sleep(1 * time.Second)
+				if err := os.Remove(file); err != nil {
+					logger.Printf("[%s] [ERROR] Failed to delete %s after retry: %v\n", time.Now().UTC().Format(time.RFC3339), file, err)
+				} else {
+					logger.Printf("[%s] [INFO] %s deleted successfully after retry\n", time.Now().UTC().Format(time.RFC3339), file)
+				}
+			} else {
+				logger.Printf("[%s] [INFO] %s deleted successfully\n", time.Now().UTC().Format(time.RFC3339), file)
+			}
+		}
+		logger.Printf("[%s] [INFO] Local file deletion process completed\n", time.Now().UTC().Format(time.RFC3339))
 	}
 
 	// Self-delete after completing main operations
@@ -283,43 +338,85 @@ func main() {
 	}
 }
 
-func uploadToAPI(jsonlFile string, logger *log.Logger) error {
-	// API details
-	apiURL := "https://your-api-url.com/upload"
-	apiKey := "your-api-key"
-
-	// Prepare the multipart form data
-	body := &bytes.Buffer{}
-	writer := multipart.NewWriter(body)
-
-	// Add jsonl file to the form
-	jsonlFileWriter, err := writer.CreateFormFile("jsonl_file", filepath.Base(jsonlFile))
+func uploadToAPI(jsonlFile string, logger *log.Logger, apiURL, apiKey string) error {
+	// Open the JSONL file
+	file, err := os.Open(jsonlFile)
 	if err != nil {
-		return fmt.Errorf("error creating form file for jsonl: %v", err)
+		return fmt.Errorf("error opening jsonl file: %v", err)
 	}
-	jsonlFileContent, err := os.ReadFile(jsonlFile)
-	if err != nil {
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	buffer := make([]byte, 0, 1024*1024) // 1MB buffer
+	scanner.Buffer(buffer, 5*1024*1024)  // Allow up to 5MB per line
+
+	var batch []string
+	batchSize := 0
+	maxBatchSize := 4 * 1024 * 1024 // 4MB max batch size
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		lineSize := len(line)
+
+		if batchSize+lineSize > maxBatchSize {
+			// Upload current batch
+			err = uploadBatch(apiURL, apiKey, batch)
+			if err != nil {
+				return fmt.Errorf("error uploading batch: %v", err)
+			}
+			logger.Printf("[%s] [INFO] Batch uploaded successfully\n", time.Now().UTC().Format(time.RFC3339))
+
+			// Reset batch
+			batch = []string{}
+			batchSize = 0
+		}
+
+		batch = append(batch, line)
+		batchSize += lineSize
+	}
+
+	if err := scanner.Err(); err != nil {
 		return fmt.Errorf("error reading jsonl file: %v", err)
 	}
-	_, err = jsonlFileWriter.Write(jsonlFileContent)
-	if err != nil {
-		return fmt.Errorf("error writing jsonl file to form: %v", err)
+
+	// Upload final batch if not empty
+	if len(batch) > 0 {
+		err = uploadBatch(apiURL, apiKey, batch)
+		if err != nil {
+			return fmt.Errorf("error uploading final batch: %v", err)
+		}
+		logger.Printf("[%s] [INFO] Final batch uploaded successfully\n", time.Now().UTC().Format(time.RFC3339))
 	}
 
-	// Close the multipart writer
-	err = writer.Close()
+	logger.Printf("[%s] [INFO] JSONL file successfully uploaded to API\n", time.Now().UTC().Format(time.RFC3339))
+	return nil
+}
+
+func uploadBatch(apiURL, apiKey string, batch []string) error {
+	// Prepare the JSON payload
+	payload := struct {
+		Events []json.RawMessage `json:"events"`
+	}{
+		Events: make([]json.RawMessage, len(batch)),
+	}
+
+	for i, line := range batch {
+		payload.Events[i] = json.RawMessage(line)
+	}
+
+	jsonPayload, err := json.Marshal(payload)
 	if err != nil {
-		return fmt.Errorf("error closing multipart writer: %v", err)
+		return fmt.Errorf("error marshalling JSON payload: %v", err)
 	}
 
 	// Create the request
-	req, err := http.NewRequest("POST", apiURL, body)
+	req, err := http.NewRequest("POST", apiURL, bytes.NewBuffer(jsonPayload))
 	if err != nil {
 		return fmt.Errorf("error creating request: %v", err)
 	}
 
 	// Set headers
-	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 
 	// Send the request
@@ -332,14 +429,15 @@ func uploadToAPI(jsonlFile string, logger *log.Logger) error {
 
 	// Check the response
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("API request failed with status code: %d", resp.StatusCode)
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("API request failed with status code: %d, body: %s", resp.StatusCode, string(body))
 	}
 
-	logger.Printf("[%s] [INFO] JSONL file successfully uploaded to API\n", time.Now().UTC().Format(time.RFC3339))
 	return nil
 }
 
-// selfDelete initiates deletion of the executable after a delay
+// selfDelete initiates the deletion of the executable after a delay
+// This ensures the program can finish its operations before removing itself
 func selfDelete() error {
 	exe, err := os.Executable()
 	if err != nil {
